@@ -127,3 +127,22 @@ variable "DB_PASSWORD" {
   type        = string
 
 }
+variable "subdomain_env" {
+  description = "Subdomain environment (dev or demo)"
+  type        = string
+  default     = "dev" # Or "demo", depending on context
+}
+
+variable "upscale_threshold" {
+  description = "Threshold for scaling up"
+  type        = number
+  default     = 37
+
+}
+
+variable "downscale_threshold" {
+  description = "Threshold for scaling down"
+  type        = number
+  default     = 32
+
+}
