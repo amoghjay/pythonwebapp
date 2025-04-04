@@ -75,36 +75,46 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-# Creating Security Group for Web Application
+# Updated Security Group for EC2 Instance
 resource "aws_security_group" "app_sg" {
   name        = "app_security_group"
-  description = "Allow web traffic and SSH"
-  vpc_id      = aws_vpc.main.id # Use the created VPC
+  description = "Restrict direct access to app; allow SSH only"
+  vpc_id      = aws_vpc.main.id
 
   ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # Allows SSH access
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "SSH access"
   }
 
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Load Balancer Security Group (lb_sg)
+resource "aws_security_group" "lb_sg" {
+  name        = "load-balancer-sg"
+  description = "Allow HTTP and HTTPS traffic"
+  vpc_id      = aws_vpc.main.id
+
   ingress {
+    description = "Allow HTTP from anywhere"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # Allow HTTP traffic
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
+    description = "Allow HTTPS from anywhere"
     from_port   = 443
     to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # Allow HTTPS traffic
-  }
-
-  ingress {
-    from_port   = 8080 # Web Application port
-    to_port     = 8080
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -115,7 +125,34 @@ resource "aws_security_group" "app_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name = "load-balancer-sg"
+  }
 }
+
+# Allow LB to reach app on port 8080
+resource "aws_security_group_rule" "app_allow_lb" {
+  type                     = "ingress"
+  from_port                = 8080
+  to_port                  = 8080
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.lb_sg.id
+  security_group_id        = aws_security_group.app_sg.id
+  description              = "Allow traffic from Load Balancer"
+}
+
+# Allow SSH from anywhere
+# resource "aws_security_group_rule" "app_allow_ssh" {
+#   type              = "ingress"
+#   from_port         = 22
+#   to_port           = 22
+#   protocol          = "tcp"
+#   cidr_blocks       = ["0.0.0.0/0"]
+#   security_group_id = aws_security_group.app_sg.id
+#   description       = "Allow SSH from anywhere"
+# }
+
 
 # Creating S3 Bucket for Web Application 
 resource "random_uuid" "s3_bucket_uuid" {}
@@ -284,18 +321,42 @@ resource "aws_db_instance" "webapp_rds" {
   }
 }
 
+# Target Group for Load Balancer
+resource "aws_lb_target_group" "webapp_tg" {
+  name     = "webapp-target-group"
+  port     = 8080
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main.id
 
-# Creating EC2 Instance in Public Subnet
-resource "aws_instance" "app_instance" {
-  ami                         = var.aws_ami_id
-  instance_type               = var.aws_instance_type
-  vpc_security_group_ids      = [aws_security_group.app_sg.id]
-  subnet_id                   = aws_subnet.public[0].id #using the first public subnet for now
-  associate_public_ip_address = true                    # Ensure it gets a public IP
-  key_name                    = var.aws_key_name
-  iam_instance_profile        = aws_iam_instance_profile.ec2_instance_profile.name # Attach IAM role ${aws_s3_bucket.webapp_s3.id}
+  health_check {
+    path                = "/healthz"
+    port                = "8080"
+    protocol            = "HTTP"
+    healthy_threshold   = 3
+    unhealthy_threshold = 2
+    timeout             = 5
+    interval            = 300
+  }
+}
 
-  user_data = <<-EOF
+# Launch Template 
+resource "aws_launch_template" "webapp_template" {
+  name_prefix   = "csye6225-asg-template-"
+  image_id      = var.aws_ami_id
+  instance_type = var.aws_instance_type
+  key_name      = var.aws_key_name
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_instance_profile.name
+  }
+
+  # ✅ Attach public IP here
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.app_sg.id]
+  }
+
+  user_data = base64encode(<<-EOF
               #!/bin/bash
               cat > /opt/csye6225/webapp/.env << EOL
               DATABASE_URL=postgresql://${var.DB_USERNAME}:${var.DB_PASSWORD}@${aws_db_instance.webapp_rds.address}:5432/${var.DB_NAME}
@@ -310,15 +371,147 @@ resource "aws_instance" "app_instance" {
                   -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
                   -s
               EOF
+  )
 
-
-  root_block_device {
-    volume_size           = var.aws_volume_size
-    volume_type           = var.aws_volume_type
-    delete_on_termination = true
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size           = var.aws_volume_size
+      volume_type           = var.aws_volume_type
+      delete_on_termination = true
+    }
   }
 
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "webapp-instance"
+    }
+  }
+}
+
+# Auto Scaling Group
+resource "aws_autoscaling_group" "webapp_asg" {
+  name                      = "csye6225-asg"
+  min_size                  = 3
+  max_size                  = 5
+  desired_capacity          = 3
+  vpc_zone_identifier       = aws_subnet.public[*].id
+  health_check_type         = "EC2"
+  health_check_grace_period = 120
+
+  launch_template {
+    id      = aws_launch_template.webapp_template.id
+    version = "$Latest"
+  }
+
+  target_group_arns = [aws_lb_target_group.webapp_tg.arn]
+
+  tag {
+    key                 = "Name"
+    value               = "webapp-asg"
+    propagate_at_launch = true
+  }
+}
+
+# Scaling Policy
+resource "aws_autoscaling_policy" "scale_up_policy" {
+  name                   = "scale-up-on-cpu"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 60
+  autoscaling_group_name = aws_autoscaling_group.webapp_asg.name
+}
+
+resource "aws_cloudwatch_metric_alarm" "high_cpu_alarm" {
+  alarm_name          = "high-cpu-usage"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.upscale_threshold
+  alarm_description   = "Triggers when average CPU > 35%"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.webapp_asg.name
+  }
+
+  alarm_actions = [aws_autoscaling_policy.scale_up_policy.arn]
+}
+
+resource "aws_autoscaling_policy" "scale_down_policy" {
+  name                   = "scale-down-on-cpu"
+  scaling_adjustment     = -1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 60
+  autoscaling_group_name = aws_autoscaling_group.webapp_asg.name
+}
+
+resource "aws_cloudwatch_metric_alarm" "low_cpu_alarm" {
+  alarm_name          = "low-cpu-usage"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.downscale_threshold
+  alarm_description   = "Triggers when average CPU < 20%"
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.webapp_asg.name
+  }
+
+  alarm_actions = [aws_autoscaling_policy.scale_down_policy.arn]
+}
+
+
+# Application Load Balancer
+resource "aws_lb" "webapp_alb" {
+  name               = "csye6225-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.lb_sg.id]
+  subnets            = aws_subnet.public[*].id
+
+  enable_deletion_protection = false
+
   tags = {
-    Name = "WebAppInstance"
+    Name = "webapp-alb"
+  }
+}
+
+# Listener for ALB
+
+resource "aws_lb_listener" "webapp_listener" {
+  load_balancer_arn = aws_lb.webapp_alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.webapp_tg.arn
+  }
+}
+
+###############################
+# Route53 Hosted Zone Lookup
+###############################
+data "aws_route53_zone" "main_zone" {
+  name         = "${var.subdomain_env}.amoghjayasimha.me"
+  private_zone = false
+}
+
+# A Record for dev/demo
+resource "aws_route53_record" "dev_alias" {
+  zone_id = data.aws_route53_zone.main_zone.zone_id
+  name    = "" # Root domain
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.webapp_alb.dns_name
+    zone_id                = aws_lb.webapp_alb.zone_id
+    evaluate_target_health = true
   }
 }
